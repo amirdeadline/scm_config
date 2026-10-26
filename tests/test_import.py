@@ -215,6 +215,19 @@ def test_main_dry_run_writes_report_and_does_not_prompt(fake_scm, monkeypatch, t
     assert client.calls == []
 
 
+def test_main_saves_one_report_per_requested_format(fake_scm, monkeypatch, tmp_path):
+    client = fake_scm(folders=[{"name": "Lab"}])
+    monkeypatch.setattr(config_import.ScmClient, "from_settings", classmethod(lambda cls: client))
+    monkeypatch.setattr(config_import, "setup_logging", lambda *a, **k: tmp_path / "log")
+    reports = [tmp_path / f"diff.{ext}" for ext in ("txt", "md", "html", "json", "csv")]
+    args = ["--input", str(write_export(tmp_path)), "--folder", "Lab", "--dry-run"]
+    for report in reports:
+        args += ["--report", str(report)]
+    assert config_import.main(args) == 0
+    assert all(r.exists() and r.stat().st_size > 0 for r in reports)
+    assert json.loads(reports[3].read_text(encoding="utf-8"))["summary"]["create"] > 0
+
+
 def test_folder_and_snippet_are_mutually_exclusive(tmp_path):
     with pytest.raises(SystemExit):
         config_import.parse_args(["--input", "x.json", "--folder", "a", "--snippet", "b"])
@@ -319,6 +332,86 @@ def test_new_snippet_rules_are_ordered_although_scm_lists_them_under_pre(fake_sc
     assert [r["name"] for r in client.items[RULES]] == ["r1", "r2", "r3"]
 
 
+def test_create_that_timed_out_but_was_applied_is_not_sent_again(fake_scm):
+    client = fake_scm()
+    original = client.create
+
+    def applied_then_timeout(path, body, params=None):
+        original(path, body, params)
+        if body["name"] == "db":
+            raise ConnectionError("POST timed out")
+
+    client.create = applied_then_timeout
+    client.fail_once = {"servers"}  # forces a second pass
+    desired = merge_sources([("folder", "F", {"objects/addresses": [{"name": "web"}, {"name": "db"}],
+                                              "objects/address-groups": [{"name": "servers", "static": ["db"]}]})])
+    done, failed = apply_changes(client, plan_changes(desired, {}), "snippet", "T")
+    assert failed == []
+    assert sorted(c.name for c in done) == ["db", "servers", "web"]
+    assert [i["name"] for i in client.items[ADDR]].count("db") == 1
+
+
+def test_create_that_timed_out_and_was_not_applied_is_retried(fake_scm):
+    client = fake_scm()
+    original = client.create
+    timeouts = {"db"}
+
+    def timeout_once(path, body, params=None):
+        if body["name"] in timeouts:
+            timeouts.discard(body["name"])
+            raise ConnectionError("POST timed out")
+        return original(path, body, params)
+
+    client.create = timeout_once
+    desired = merge_sources([("folder", "F", {"objects/addresses": [{"name": "web"}, {"name": "db"}]})])
+    done, failed = apply_changes(client, plan_changes(desired, {}), "snippet", "T")
+    assert failed == [] and sorted(c.name for c in done) == ["db", "web"]
+
+
+def test_one_failed_move_does_not_stop_placing_the_other_new_rules(fake_scm):
+    client = fake_scm(items={RULES: [
+        {"id": "e1", "name": "E1", "snippet": "T", "action": "allow"},
+        {"id": "e2", "name": "E2", "snippet": "T", "action": "allow"},
+    ]})
+    desired = merge_sources([("folder", "F", {"security/security-rules": {"pre": [
+        {"name": n, "action": "allow"} for n in ("N1", "E1", "N2", "E2", "N3")]}})])
+    done, _ = apply_changes(client, plan_changes(desired, read_current(client, "snippet", "T", set(desired.items))),
+                            "snippet", "T")
+    original_move = client.move_rule
+    first = []
+
+    def fail_first(path, rule_id, rulebase, destination, destination_rule=None):
+        if not first:
+            first.append(rule_id)
+            raise config_import.ApiError("POST", path, 400, {"_errors": [{"message": "move refused"}]})
+        return original_move(path, rule_id, rulebase, destination, destination_rule)
+
+    client.move_rule = fail_first
+    warnings = restore_rule_order(client, desired, done, "snippet", "T")
+    assert len(warnings) == 1 and "N1" in warnings[0] and "move refused" in warnings[0]
+    assert [r["name"] for r in client.items[RULES]] == ["E1", "N2", "E2", "N3", "N1"]
+
+
+def test_type_that_cannot_be_read_from_the_target_is_skipped(fake_scm):
+    client = fake_scm(unsupported={ADDR: 403})
+    desired = merge_sources([("folder", "F", {"objects/addresses": [{"name": "web"}],
+                                              "objects/tags": [{"name": "t"}]})])
+    changes = plan_changes(desired, read_current(client, "folder", "F", set(desired.items)))
+    by_name = {c.name: c for c in changes}
+    assert by_name["web"].action == SKIP and "could not be read" in by_name["web"].reason
+    assert by_name["t"].action == CREATE
+
+
+def test_rule_update_keeps_the_rulebase_scm_reports(fake_scm):
+    client = fake_scm(items={RULES: [
+        {"id": "p1", "name": "late", "folder": "F", "position": "post", "_position": "post", "action": "allow"}]})
+    desired = merge_sources([("folder", "F", {"security/security-rules": {"pre": [{"name": "late", "action": "deny"}]}})])
+    changes = plan_changes(desired, read_current(client, "folder", "F", set(desired.items)))
+    assert changes[0].action == UPDATE and changes[0].position == "post"
+    apply_changes(client, changes, "folder", "F")
+    assert ("update", RULES, "late", {"position": "post"}) in client.calls
+
+
 def test_existing_item_without_id_is_skipped():
     desired = merge_sources([("snippet", "S", {"objects/addresses": [{"name": "a", "fqdn": "x"}]})])
     change = plan_changes(desired, {("objects/addresses", None): {"a": {"name": "a"}}})[0]
@@ -352,7 +445,7 @@ def test_round_trip_into_same_folder_imports_only_that_folder(fake_scm, monkeypa
     assert "~ OVERWRITE objects/addresses 'db'" in out
     assert "OVERWRITE objects/addresses 'web'" not in out   # unchanged, gp's version ignored
     updates = [c for c in client.calls if c[0] == "update"]
-    assert updates == [("update", ADDR, "db")]
+    assert updates == [("update", ADDR, "db", None)]
     web = next(i for i in client.items[ADDR] if i["name"] == "web")
     assert web["ip_netmask"] == "10.0.0.1/32"
     reports = list((tmp_path / "logs").glob("config_import_report_*.txt"))

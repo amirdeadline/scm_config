@@ -8,6 +8,8 @@ from typing import Optional
 from scm_catalog import ENDPOINTS, ENDPOINTS_BY_KEY, RULE_POSITIONS, match_key, strip_server_fields
 
 CREATE, UPDATE, UNCHANGED, SKIP = "create", "update", "unchanged", "skip"
+# Key in the "current" mapping: {endpoint key: reason} for config types the target could not be read for.
+UNREADABLE = "__unreadable__"
 
 
 @dataclass(frozen=True)
@@ -129,6 +131,7 @@ def plan_changes(desired: Desired, current: dict) -> list:
     snippet rules or Prisma Access folder rules, and an existing rule is updated
     where it is, never moved between pre and post.
     """
+    unreadable = current.get(UNREADABLE, {})
     changes = []
     for endpoint in ENDPOINTS:
         positions = RULE_POSITIONS if endpoint.rules else (None,)
@@ -143,18 +146,26 @@ def plan_changes(desired: Desired, current: dict) -> list:
             for item_key, (item, source) in bucket.items():
                 common = dict(endpoint_key=endpoint.key, name=item_key, source=source,
                               position=position, desired=item)
-                if not endpoint.importable:
-                    changes.append(Change(SKIP, reason=endpoint.import_note, **common))
-                elif item_key not in existing:
-                    changes.append(Change(CREATE, **common))
-                elif not existing[item_key].get("id"):
-                    changes.append(Change(SKIP, reason="existing object has no id in the API response; "
-                                                       "update it manually", **common))
-                elif comparable(existing[item_key]) == comparable(item):
-                    changes.append(Change(UNCHANGED, current=existing[item_key], **common))
-                else:
-                    changes.append(Change(UPDATE, current=existing[item_key], **common))
+                changes.append(classify(endpoint, existing.get(item_key), unreadable.get(endpoint.key), common))
     return changes
+
+
+def classify(endpoint, found: Optional[dict], unreadable: Optional[str], common: dict) -> Change:
+    """The action for one item of the file, given the matching item in the target (or None)."""
+    if not endpoint.importable:
+        return Change(SKIP, reason=endpoint.import_note, **common)
+    if unreadable:
+        # Without the current content there is no correct diff, and a create could clash.
+        return Change(SKIP, reason=f"the current {endpoint.key} of the target could not be read "
+                                   f"({unreadable}); not imported", **common)
+    if found is None:
+        return Change(CREATE, **common)
+    if not found.get("id"):
+        return Change(SKIP, reason="existing object has no id in the API response; update it manually", **common)
+    if found.get("position") in RULE_POSITIONS:
+        common = {**common, "position": found["position"]}  # the rule stays in the rulebase SCM reports
+    action = UNCHANGED if comparable(found) == comparable(common["desired"]) else UPDATE
+    return Change(action, current=found, **common)
 
 
 # ----------------------------------------------------------------- reporting

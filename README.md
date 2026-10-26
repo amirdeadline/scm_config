@@ -1,13 +1,14 @@
 # SCM Config Export / Import
 
-Two command-line tools for Palo Alto Networks Strata Cloud Manager (SCM):
+Command-line tools for Palo Alto Networks Strata Cloud Manager (SCM):
 
 | Script | What it does |
 |---|---|
 | `config_export.py` | Exports the custom configuration of all folders and snippets, or only the ones you name, to one JSON file. |
-| `config_import.py` | Imports that JSON file into a snippet (default) or a folder. It shows a full dry-run diff first and changes nothing until you type `YES`. |
+| `replace_domain.py` | Replaces an old AD domain with a new one in the user and group IDs of an export file. Works offline. |
+| `config_import.py` | Imports that JSON file into a snippet (default) or a folder. It shows a full dry-run diff first, which you can save as text, Markdown, HTML, JSON or CSV. It changes nothing until you type `YES`. |
 
-Both scripts read the SCM service account from [settings.py](settings.py).
+The export and import scripts read the SCM service account from [settings.py](settings.py).
 Testers: start with [TEST_PLAN.md](TEST_PLAN.md).
 
 ## Setup
@@ -159,43 +160,106 @@ The full list, in import order, is in [scm_catalog.py](scm_catalog.py).
 - An object with the same name in several folders or snippets appears under each one.
 - SCM-managed fields (`id`, `folder`, `snippet`) are removed.
 
-## Bulk change: export, find and replace, import back
+## Bulk change: new AD domain for users and groups
 
-This is the main use case. For example, 1000 GlobalProtect rules use users and
-groups from an old Active Directory domain. The names stay the same and only the
-domain changes.
+This is the main use case. The rules and objects of a folder such as
+`Mobile Users` name users and groups from an old Active Directory domain. Only the
+domain has changed.
 
-```bash
-python config_export.py --folder "GlobalProtect" --output gp.json
-```
-
-Open `gp.json` and replace the old domain with the new one, for example
-`OLDCORP\\` with `NEWCORP\\`. Inside JSON a backslash is written twice, so
-`OLDCORP\jsmith` appears in the file as `OLDCORP\\jsmith`. For distinguished names,
-replace `dc=oldcorp` with `dc=newcorp`. Then check the change before you apply it:
+**1. Export the folder.** The file also holds the parent folders and snippets the
+folder inherits from, so it doubles as a backup.
 
 ```bash
-python config_import.py --input gp.json --folder "GlobalProtect" --dry-run
+python config_export.py --folder "Mobile Users" --output mu.json
 ```
 
-Then apply it:
+**2. Replace the domain.** `replace_domain.py` reads the export and writes a new
+file. It changes only user and group IDs, in every field of every object and rule:
+
+| Form | Before | After |
+|---|---|---|
+| NetBIOS | `OLDCORP\jsmith` | `NEWCORP\jsmith` |
+| UPN / e-mail | `jsmith@oldcorp.local` | `jsmith@newcorp.local` |
+| LDAP DN | `cn=vpn,dc=oldcorp,dc=local` | `cn=vpn,dc=newcorp,dc=local` |
+| Domain field | `"user_domain": "OLDCORP"` | `"user_domain": "NEWCORP"` |
+
+A domain field is a field whose name contains `domain` and whose whole value is
+the old domain.
 
 ```bash
-python config_import.py --input gp.json --folder "GlobalProtect"
+python replace_domain.py --input mu.json --output mu_new.json --source "Mobile Users" --old-domain OLDCORP --new-domain NEWCORP --old-dns oldcorp.local --new-dns newcorp.local --changes replaced.csv
 ```
+
+- **What changes and what doesn't:** the domain is matched without regard to
+  case. Left alone:
+  - object and rule names;
+  - FQDNs, URLs and UNC paths (`\\oldcorp\share`);
+  - other text that only contains the domain name;
+  - a DN of a longer domain (`dc=oldcorp,dc=local,dc=com`).
+- **Server profiles are left alone by default.** LDAP, RADIUS, TACACS+, Kerberos,
+  SAML and MFA server profiles hold the directory servers' base DN and bind
+  account, which change only when the servers change. Add
+  `--include-server-profiles` to change them too.
+- **Check the count per form.** The tool prints how many values it changed in
+  each form, for example `NetBIOS: 47, UPN: 2, LDAP DN: 45`. A 0 where you expected
+  matches usually means a mistyped `--old-dns`.
+- **No escaping needed:** the file is read as JSON, so give the domain plainly.
+- **Every replaced value is listed:** on the console, and with `--changes` in a
+  CSV file.
+- **Your export stays as a backup:** the input file is never overwritten.
+- **Editing by hand also works.** Inside JSON a backslash is written twice, so
+  `OLDCORP\jsmith` appears in the file as `OLDCORP\\jsmith`.
+
+**3. Review the full diff.** Save it in any format you need. `--report` can be
+repeated:
+
+```bash
+python config_import.py --input mu_new.json --folder "Mobile Users" --dry-run --report diff.html --report diff.csv --report diff.json
+```
+
+**4. Apply it.** Type `YES` when asked.
+
+```bash
+python config_import.py --input mu_new.json --folder "Mobile Users"
+```
+
+**5. Check.** Run step 3 again. It should report `0 to create, 0 to overwrite`.
+
+What to expect:
 
 - **Only that folder is imported.** The target has the same name as a folder in
-  the file, so the folder's attached snippets in the file are not copied into it.
-  To also change a snippet, import it into itself:
-  `--input gp.json --snippet "<snippet>"`.
-- **Only real changes are listed.** Objects whose content changed are shown as a
-  diff and overwritten. Untouched objects are listed as unchanged and left alone.
-- **Rule positions are kept.** Overwritten rules keep their position.
-- **The full report is saved.** It goes to `logs/config_import_report_<timestamp>.txt`
-  so you can review a large change in an editor before typing `YES`.
-- **The result lands in the candidate config.** Review it in SCM, then push yourself.
+  the file, so the parent folders and snippets in the file are left alone. To
+  change a snippet too, import it into itself:
+  `--input mu_new.json --snippet "<snippet>"`.
+- **Changed objects are overwritten.** Each one is shown as a diff. Untouched
+  objects are listed as unchanged and are not sent to SCM.
+- **New objects and rules in the file are created.** Each new rule is placed next
+  to its neighbour from the file.
+- **Nothing is deleted, and existing rules are never moved.** An updated rule
+  stays in its rulebase. If a new rule cannot be moved, that rule is reported
+  and the others are still placed.
+- **A create that hits a timeout is not repeated blindly.** The tool first checks
+  whether SCM saved it, so no object is created twice.
+- **A config type that cannot be read from the target is skipped.** Its items are
+  listed under skipped, not shown as new.
+- **The whole object is replaced.** A field that is in SCM but not in the file is
+  removed. The diff shows it as a `-` line, and the CSV report marks it
+  `removed by the import`.
+- **The result lands in the candidate config.** Review it in SCM, then push it yourself.
+- **Run time:** about 1 second per changed object, so 1000 changed rules take
+  about 15 minutes.
 - **Do not change object or rule names.** Objects are matched by name, so a
   renamed object is created as a new one and the old one stays.
+
+### Report formats
+
+| Extension | Content |
+|---|---|
+| `.txt` | The report as printed on the console. |
+| `.md` | Summary table, then a `diff` block per overwrite and a `json` block per new object. |
+| `.html` | One page: summary, then one expandable diff per object, with the changed field names. |
+| `.json` | Every change with its field-level current and new values, both full objects, and the unchanged names. |
+| `.csv` | One row per changed field (action, config type, rulebase, name, field, current, new, note). Opens in Excel. |
 
 ## Import
 
@@ -213,7 +277,7 @@ python config_import.py --input gp.json --snippet "GP-Copy" --dry-run --report d
 | `--folder NAME` | Target folder. It must already exist. |
 | `--source NAME` | Import only this folder or snippet from the file. Repeatable. |
 | `--dry-run` | Show the report and exit without asking. |
-| `--report FILE` | Where to save the plain-text report. Default `logs/config_import_report_<timestamp>.txt`. |
+| `--report FILE` | Save the dry-run report. The extension picks the format: `.txt`, `.md`, `.html`, `.json`, `.csv`. Repeatable. Default `logs/config_import_report_<timestamp>.txt`. |
 | `--no-color` | Plain text output. |
 
 Without `--snippet` or `--folder`, a new snippet `NEW_<YYYYMMDD_HHMMSS>` is created.
@@ -264,7 +328,9 @@ Objects in the target that are not in the file are never deleted.
 
 ## Logs and exit codes
 
-A full debug log is written to `logs/config_export.log` and `logs/config_import.log`.
+Each run writes its own full debug log, `logs/config_export_<timestamp>.log` or
+`logs/config_import_<timestamp>.log`. Earlier logs are kept, so the log of an
+import that changed SCM survives later runs.
 Use `--verbose` to see debug output on the console.
 
 | Exit code | Meaning |

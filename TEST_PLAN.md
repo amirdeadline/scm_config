@@ -12,8 +12,10 @@ explains setup and every option.
 | Import that creates objects and rules in a new snippet | Tested on a live lab tenant (55 items, folder plus inherited config) |
 | Import that **overwrites** existing objects or rules in a snippet | Tested on a live lab tenant |
 | Rule placement after import (move API) | Tested on a live lab tenant (snippet) |
-| Import that writes into a **folder** | Dry run tested live; writes are covered by unit tests only |
-| Large imports (hundreds of rules, rate limits) | Not tested |
+| **Bulk AD domain change in `Mobile Users`** (export, `replace_domain.py`, import into the same folder) | Tested on a live lab tenant in 3 rounds. Users and groups in NetBIOS, UPN and DN form (lower and upper case), 45+ security rules, a decryption rule and an authentication profile. Each round: up to 50 changes, 0 failures, 0 deletions, existing rule order unchanged, new rules placed after their neighbour, re-run clean, checked by an independent before/after comparison |
+| Updating a post rule keeps it in post | Tested on a live lab tenant |
+| Dry-run report as `.txt` `.md` `.html` `.json` `.csv` | Tested on a live lab tenant |
+| Large imports (1000+ rules, rate limits) | Not tested; measured about 0.85 s per change |
 
 Every import writes to the **candidate config only**. Nothing reaches devices or
 Prisma Access until someone pushes in SCM.
@@ -22,7 +24,7 @@ Prisma Access until someone pushes in SCM.
 
 1. Python 3.9 or later, then `pip install -r requirements.txt`.
 2. Fill in `settings.py` (the file says where to find each value).
-3. Optional: `pip install pytest` then `python -m pytest -q`. 63 tests should pass.
+3. Optional: `pip install pytest` then `python -m pytest -q`. 103 tests should pass.
 
 ## Tests to run
 
@@ -42,10 +44,13 @@ Run them in this order and keep each report from `logs/`.
    - the dry run shows exactly those changes;
    - after `YES`, SCM shows the edits;
    - the new rules sit next to their neighbours from the file.
-6. **Bulk find and replace in a lab folder.** Follow "Bulk change" in the README.
-   Expected:
-   - only the edited items are listed as overwrites;
-   - rule positions are unchanged.
+6. **Bulk AD domain change in a lab folder.** Follow "Bulk change" in the README:
+   `config_export.py`, then `replace_domain.py`, then `config_import.py --folder`.
+   Save the dry run with `--report diff.html --report diff.csv`. Expected:
+   - only objects that hold old-domain users or groups are listed as overwrites;
+   - in the CSV, the changed fields are the user fields only (`source_user`, `allow_list`, ...);
+   - nothing is deleted, rule positions are unchanged;
+   - the old domain no longer appears in the folder (export it again and search).
 7. **Re-run.** Repeat the dry run of step 5 or 6. Expected: `0 to create, 0 to overwrite`.
 
 After each test, review the candidate config in SCM. Revert it or push it there.
@@ -55,8 +60,8 @@ After each test, review the candidate config in SCM. Revert it or push it there.
 Send these:
 - the command you ran;
 - the console output;
-- `logs/config_export.log` or `logs/config_import.log`;
-- the `logs/config_import_report_*.txt` file.
+- the matching `logs/config_export_<timestamp>.log` or `logs/config_import_<timestamp>.log`;
+- the report files (`logs/config_import_report_*.txt`, or the ones you saved with `--report`).
 
 The logs contain config details from your tenant but never the client secret.
 Remove anything sensitive before you share them.

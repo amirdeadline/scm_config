@@ -46,9 +46,12 @@ log = logging.getLogger("scm")
 
 
 def setup_logging(log_name: str, verbose: bool = False) -> Path:
-    """Console at INFO (DEBUG with --verbose), full DEBUG log in logs/<log_name>.log."""
+    """Console at INFO (DEBUG with --verbose), full DEBUG log in logs/<log_name>_<timestamp>.log.
+
+    One file per run, so the log of an import that changed SCM is kept after later runs.
+    """
     LOG_DIR.mkdir(exist_ok=True)
-    log_file = LOG_DIR / f"{log_name}.log"
+    log_file = LOG_DIR / f"{log_name}_{time.strftime('%Y%m%d_%H%M%S')}.log"
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
     file_handler = logging.FileHandler(log_file, mode="w", encoding="utf-8")
@@ -181,9 +184,12 @@ class ScmClient:
                 self.settings_file))
         if response.status_code != 200:
             raise ConnectionError(f"Token request failed: HTTP {response.status_code} {response.text[:200]}")
-        token = response.json()
-        self._token = token["access_token"]
-        self._token_expires_at = time.time() + int(token.get("expires_in", 900))
+        try:
+            token = response.json()
+            self._token = token["access_token"]
+            self._token_expires_at = time.time() + int(token.get("expires_in", 900))
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ConnectionError(f"Unexpected token response from {TOKEN_URL}: {exc}")
         log.debug("Access token acquired, expires in %ss", token.get("expires_in"))
 
     def _auth_header(self):
@@ -199,6 +205,13 @@ class ScmClient:
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 headers = self._auth_header()
+            except ConnectionError:
+                # The token refresh failed before anything was sent, so even a POST is safe to retry.
+                if attempt == MAX_RETRIES:
+                    raise
+                time.sleep(2 ** attempt)
+                continue
+            try:
                 with self._slots:
                     response = self.http.request(method, url, params=params, json=body,
                                                  headers=headers, timeout=REQUEST_TIMEOUT)
@@ -281,8 +294,8 @@ class ScmClient:
     def create(self, path, body, params=None):
         return self.request("POST", path, params=params, body=body)
 
-    def update(self, path, object_id, body):
-        return self.request("PUT", f"{path}/{object_id}", body=body)
+    def update(self, path, object_id, body, params=None):
+        return self.request("PUT", f"{path}/{object_id}", params=params, body=body)
 
     def move_rule(self, path, rule_id, rulebase, destination, destination_rule=None):
         body = {"destination": destination, "rulebase": rulebase}

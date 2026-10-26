@@ -11,8 +11,9 @@ from pathlib import Path
 from scm_catalog import (BUILTIN_FOLDERS, ENDPOINTS_BY_KEY, RULE_POSITIONS, is_builtin_snippet,
                          match_key, read_owned, strip_server_fields)
 from scm_client import LOG_DIR, SETTINGS_FILE, ApiError, ScmClient, SettingsError, setup_logging
-from scm_import_plan import (CREATE, UPDATE, Palette, list_sources, load_export, merge_sources,
-                             plan_changes, render_report, select_sources)
+from scm_import_plan import (CREATE, UNREADABLE, UPDATE, Palette, list_sources, load_export,
+                             merge_sources, plan_changes, render_report, select_sources)
+from scm_report import report_format, write_report
 
 NOT_APPLICABLE_STATUSES = {400, 403, 404}
 MAX_PASSES = 3  # objects that refer to objects created later are retried
@@ -52,19 +53,26 @@ Which part of the file is imported
                    target. If the same name exists in two of them, the dry run
                    lists the collision and the later one wins.
 
-Bulk change (find and replace)
-  python config_export.py --folder "GlobalProtect" --output gp.json
-  ... edit gp.json, e.g. replace  olddomain\\\\  with  newdomain\\\\  (a backslash is
-      written as two backslashes inside JSON strings) ...
-  python config_import.py --input gp.json --folder "GlobalProtect"
-  Only objects that really changed are listed and overwritten. Do not change
-  object or rule names: a renamed object is created as a new one and the old one
-  stays.
+Bulk change: new AD domain for users and groups
+  python config_export.py --folder "Mobile Users" --output mu.json
+  python replace_domain.py --input mu.json --output mu_new.json --source "Mobile Users" ^
+         --old-domain OLDCORP --new-domain NEWCORP --old-dns oldcorp.local --new-dns newcorp.local
+  python config_import.py --input mu_new.json --folder "Mobile Users" --dry-run --report diff.html
+  python config_import.py --input mu_new.json --folder "Mobile Users"
+  Only objects that really changed are listed and overwritten; new objects and
+  rules in the file are created; nothing is deleted and existing rules keep their
+  position. You can also edit the JSON by hand. Do not change object or rule
+  names: a renamed object is created as a new one and the old one stays.
 
 Report
-  The full dry-run report is printed and also saved to a text file
-  (--report FILE, default logs/config_import_report_<timestamp>.txt), so a large
-  change can be reviewed in an editor before typing YES.
+  The full dry-run report is printed and saved with --report FILE. The file
+  extension picks the format, and --report can be repeated:
+    .txt   plain text, as printed            .md    Markdown with diff blocks
+    .html  page with a diff per object       .json  every change with field-level
+    .csv   one row per changed field                current/new values
+  Default: logs/config_import_report_<timestamp>.txt. Overwrites show a full
+  diff (current SCM vs import file). An object is replaced as a whole, so a field
+  that is in SCM but not in the file is removed; the diff shows it.
 
 Not imported
   Certificates (need their private key) and a few settings objects with no
@@ -80,7 +88,7 @@ Examples
   python config_import.py --input gp.json --snippet "GP-Copy"
   python config_import.py --input full.json --folder "Lab" --source "Mobile Users"
   python config_import.py --input gp.json --snippet "GP-Copy" --dry-run --report diff.txt
-  python config_import.py --input gp.json --folder "GlobalProtect"
+  python config_import.py --input mu.json --folder "Mobile Users" --dry-run --report d.html --report d.csv
 """
 
 
@@ -97,9 +105,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="only import this folder/snippet from the file (repeatable)")
     parser.add_argument("--dry-run", action="store_true",
                         help="show the report and exit without asking or changing anything")
-    parser.add_argument("--report", metavar="FILE",
-                        help="save the dry-run report to FILE "
-                             "(default: logs/config_import_report_<timestamp>.txt)")
+    parser.add_argument("--report", action="append", default=[], metavar="FILE",
+                        help="save the dry-run report to FILE; the extension picks the format: "
+                             ".txt .md .html .json .csv (repeatable; "
+                             "default: logs/config_import_report_<timestamp>.txt)")
     parser.add_argument("--no-color", action="store_true", help="plain text report")
     parser.add_argument("--verbose", action="store_true", help="show debug output on the console")
     return parser.parse_args(argv)
@@ -128,7 +137,7 @@ def read_current(client: ScmClient, kind: str, name: str, keys: set) -> dict:
     Returns (endpoint key, position) -> {match key: item}. For rule types both
     rulebases are read, so a name clash with the other rulebase can be shown.
     """
-    current = {}
+    current = {UNREADABLE: {}}
     for key in sorted({k for k, _ in keys}):
         endpoint = ENDPOINTS_BY_KEY[key]
         if not endpoint.importable:
@@ -138,8 +147,10 @@ def read_current(client: ScmClient, kind: str, name: str, keys: set) -> dict:
         except ApiError as exc:
             if exc.status not in NOT_APPLICABLE_STATUSES and not exc.is_empty_server_error:
                 raise
-            log.debug("%s not readable in %s '%s': %s", key, kind, name, exc.message)
-            owned = {} if endpoint.rules else []
+            log.warning("  ! %s cannot be read from %s '%s' (HTTP %s); its items are skipped",
+                        key, kind, name, exc.status)
+            current[UNREADABLE][key] = f"HTTP {exc.status}"
+            continue
         groups = owned.items() if endpoint.rules else [(None, owned)]
         for position, items in groups:
             current[(key, position)] = {match_key(i, endpoint.key_field): i for i in items}
@@ -158,11 +169,32 @@ def apply_change(client: ScmClient, change, kind: str, name: str) -> None:
         params = {"position": change.position} if change.position else None
         client.create(endpoint.path, body, params=params)
     else:
-        client.update(endpoint.path, change.current["id"], body)
+        # Send the rulebase only when SCM reported it for this rule; otherwise SCM keeps it as is.
+        known = (change.current or {}).get("position") in RULE_POSITIONS
+        client.update(endpoint.path, change.current["id"], body,
+                      params={"position": change.current["position"]} if known else None)
+
+
+def may_have_been_applied(change, exc) -> bool:
+    """A create that timed out or got a 5xx may still have been saved by SCM."""
+    if change.action != CREATE:
+        return False
+    return not isinstance(exc, ApiError) or exc.status >= 500
+
+
+def exists_in_target(client: ScmClient, change, kind: str, name: str) -> bool:
+    endpoint = ENDPOINTS_BY_KEY[change.endpoint_key]
+    owned = read_owned(client, endpoint, kind, name)
+    items = [i for pos in RULE_POSITIONS for i in owned[pos]] if endpoint.rules else owned
+    return any(match_key(i, endpoint.key_field) == change.name for i in items)
 
 
 def apply_changes(client: ScmClient, changes: list, kind: str, name: str) -> tuple:
-    """Apply creates/updates; retry failures so references to later objects resolve."""
+    """Apply creates/updates; retry failures so references to later objects resolve.
+
+    A create that may have been saved despite an error is looked up before it is
+    sent again, so it is never created twice.
+    """
     pending = [c for c in changes if c.action in (CREATE, UPDATE)]
     total = len(pending)
     done = []
@@ -172,20 +204,33 @@ def apply_changes(client: ScmClient, changes: list, kind: str, name: str) -> tup
         for change in pending:
             try:
                 apply_change(client, change, kind, name)
-                done.append(change)
-                errors.pop(change.label, None)
-                log.info("  [%d/%d] %s %s", len(done), total,
-                         "created" if change.action == CREATE else "updated", change.label)
             except (ApiError, ConnectionError) as exc:
-                failed.append(change)
                 errors[change.label] = exc.message if isinstance(exc, ApiError) else str(exc)
                 log.debug("  pass %d failed %s: %s", attempt, change.label, errors[change.label])
+                if not (may_have_been_applied(change, exc) and saved_anyway(client, change, kind, name)):
+                    failed.append(change)
+                    continue
+            done.append(change)
+            errors.pop(change.label, None)
+            log.info("  [%d/%d] %s %s", len(done), total,
+                     "created" if change.action == CREATE else "updated", change.label)
         if not failed or len(failed) == len(pending):
             pending = failed
             break
         log.info("  retrying %d item(s) that may depend on objects created later ...", len(failed))
         pending = failed
     return done, [(c, errors[c.label]) for c in pending]
+
+
+def saved_anyway(client: ScmClient, change, kind: str, name: str) -> bool:
+    try:
+        found = exists_in_target(client, change, kind, name)
+    except (ApiError, ConnectionError) as exc:
+        log.debug("  could not check whether %s was saved: %s", change.label, exc)
+        return False
+    if found:
+        log.info("  note: SCM reported an error for %s, but the object was saved", change.label)
+    return found
 
 
 def place_rule(client: ScmClient, path: str, ids: dict, order: list, rule: str, position: str,
@@ -205,7 +250,8 @@ def restore_rule_order(client: ScmClient, desired, done: list, kind: str, name: 
     SCM adds new rules at the bottom of the rulebase. Each new rule is moved
     after the nearest earlier rule from the file, or, if it has none, before the
     nearest later rule that already existed. Rules that existed before the import
-    are never moved. Returns warnings.
+    are never moved. A rule that cannot be moved is reported and the others are
+    still placed. Returns warnings.
     """
     warnings = []
     created = {}
@@ -224,21 +270,35 @@ def restore_rule_order(client: ScmClient, desired, done: list, kind: str, name: 
         try:
             # Both rulebases: where SCM does not report pre/post, every rule is listed under pre.
             owned = read_owned(client, endpoint, kind, name)
-            rules = [rule for pos in RULE_POSITIONS for rule in owned[pos]]
-            ids = {r["name"]: r["id"] for r in rules}
-            order = [r["name"] for r in rules]
-            wanted = [n for n in bucket if n in ids]
-            for index, rule in enumerate(wanted):
-                if rule not in new_names:
-                    continue
-                if index > 0:
-                    place_rule(client, endpoint.path, ids, order, rule, position, "after", wanted[index - 1])
-                    continue
-                later = next((w for w in wanted[1:] if w not in new_names), None)
-                if later:
-                    place_rule(client, endpoint.path, ids, order, rule, position, "before", later)
         except (ApiError, ConnectionError) as exc:
             warnings.append(f"{key} [{position}]: rule order not restored: {exc}")
+            continue
+        rules = [r for pos in RULE_POSITIONS for r in owned[pos] if r.get("id") and r.get("name")]
+        warnings += place_new_rules(client, endpoint, position, list(bucket), new_names, rules)
+    return warnings
+
+
+def place_new_rules(client: ScmClient, endpoint, position: str, file_order: list, new_names: set,
+                    rules: list) -> list:
+    ids = {r["name"]: r["id"] for r in rules}
+    order = [r["name"] for r in rules]
+    wanted = [n for n in file_order if n in ids]
+    warnings = []
+    for index, rule in enumerate(wanted):
+        if rule not in new_names:
+            continue
+        if index > 0:
+            destination, anchor = "after", wanted[index - 1]
+        else:
+            destination = "before"
+            anchor = next((w for w in wanted[1:] if w not in new_names), None)
+            if anchor is None:
+                continue
+        try:
+            place_rule(client, endpoint.path, ids, order, rule, position, destination, anchor)
+        except (ApiError, ConnectionError) as exc:
+            warnings.append(f"{endpoint.key} [{position}] '{rule}': could not be moved {destination} "
+                            f"'{anchor}', check its position in SCM: {exc}")
     return warnings
 
 
@@ -272,7 +332,7 @@ def confirm(changes: list, target_label: str) -> bool:
     except EOFError:
         return False
     # Windows PowerShell 5.1 prefixes piped input with a byte-order mark.
-    return answer.lstrip("﻿").strip() == "YES"
+    return answer.lstrip(chr(0xFEFF)).strip() == "YES"
 
 
 def main(argv=None) -> int:
@@ -316,14 +376,12 @@ def main(argv=None) -> int:
     changes = plan_changes(desired, current)
     print(render_report(changes, desired, target_label, colors))
     sys.stdout.flush()  # keep the report above the log lines when output is piped
-    report_file = Path(args.report) if args.report else default_report_file()
-    try:
-        report_file.parent.mkdir(parents=True, exist_ok=True)
-        report_file.write_text(render_report(changes, desired, target_label, Palette(False)),
-                               encoding="utf-8")
-        log.info("\nFull report saved to %s", report_file.resolve())
-    except OSError as exc:
-        log.warning("Could not save the report to %s: %s", report_file, exc)
+    for report_file in [Path(p) for p in args.report] or [default_report_file()]:
+        try:
+            write_report(report_file, changes, desired, target_label)
+            log.info("\nFull report (%s) saved to %s", report_format(report_file), report_file.resolve())
+        except OSError as exc:
+            log.warning("Could not save the report to %s: %s", report_file, exc)
 
     to_apply = [c for c in changes if c.action in (CREATE, UPDATE)]
     if not to_apply:

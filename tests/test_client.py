@@ -121,6 +121,24 @@ def test_post_is_not_retried_after_server_error(monkeypatch):
     assert len(client.http.requests) == 1
 
 
+def test_token_refresh_network_error_is_retried_even_for_post(monkeypatch):
+    # Nothing was sent to SCM yet, so retrying a POST is safe here.
+    monkeypatch.setattr(scm_client.time, "sleep", lambda s: None)
+    client = make_client([FakeResponse(201, {"id": "1"})])
+    token = client.http.token_response
+    outcomes = [scm_client.requests.ConnectionError("dns failed"), token]
+
+    def flaky_post(url, **kwargs):
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    client.http.post = flaky_post
+    assert client.request("POST", "/x", body={"name": "a"}) == {"id": "1"}
+    assert len(client.http.requests) == 1
+
+
 def test_error_message_handles_unexpected_shapes():
     assert ApiError("GET", "/x", 400, {"_errors": ["plain"]}).message == "plain"
     assert ApiError("GET", "/x", 400, "text body").message == "text body"

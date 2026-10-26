@@ -62,8 +62,8 @@ class FakeScm:
         self.items.setdefault(path, []).append(stored)
         return stored
 
-    def update(self, path, object_id, body):
-        self.calls.append(("update", path, body.get("name")))
+    def update(self, path, object_id, body, params=None):
+        self.calls.append(("update", path, body.get("name"), params))
         for index, item in enumerate(self.items.get(path, [])):
             if item["id"] == object_id:
                 extra = {k: v for k, v in item.items() if k.startswith("_")}
