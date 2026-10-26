@@ -1,0 +1,12 @@
+# Run output: contains tenant configuration
+logs/
+test_run/
+dist/
+scm_export_*.json
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
