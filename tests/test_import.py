@@ -185,7 +185,8 @@ def test_main_creates_new_snippet_after_confirmation(fake_scm, monkeypatch, tmp_
 def test_main_accepts_yes_piped_from_windows_powershell(fake_scm, monkeypatch, tmp_path):
     # Windows PowerShell 5.1 puts a byte-order mark in front of text piped to a program.
     client = fake_scm(snippets=[])
-    assert run_main(monkeypatch, tmp_path, client, ["--source", "Mobile Users"], answer="﻿YES\r") == 0
+    bom = chr(0xFEFF)
+    assert run_main(monkeypatch, tmp_path, client, ["--source", "Mobile Users"], answer=bom + "YES\r") == 0
     assert len(client.items[ADDR]) == 2
 
 
@@ -253,11 +254,13 @@ def test_malformed_rule_section_is_reported_not_crashing():
     assert "malformed" in desired.unknown_types[0]
 
 
-def test_rule_name_in_other_rulebase_is_skipped():
+def test_rule_name_in_other_rulebase_is_updated_where_it_is():
+    # SCM does not report pre/post for snippet rules or Prisma Access folder rules, so a rule is
+    # matched by name in either rulebase and never moved between them.
     desired = merge_sources([("snippet", "S", {"security/security-rules": {"pre": [{"name": "r1", "action": "allow"}]}})])
-    current = {("security/security-rules", "post"): {"r1": {"id": "1", "name": "r1"}}}
+    current = {("security/security-rules", "post"): {"r1": {"id": "1", "name": "r1", "action": "deny"}}}
     change = plan_changes(desired, current)[0]
-    assert change.action == SKIP and "post rulebase" in change.reason
+    assert change.action == UPDATE and change.current["id"] == "1"
 
 
 def test_override_markers_rewritten_by_scm_are_not_a_change():
@@ -281,10 +284,10 @@ def test_snippet_rule_is_matched_by_name_in_either_rulebase(fake_scm):
     client.snippet_rules_in_both = True
     unchanged = merge_sources([("folder", "All", {"security/security-rules": {"post": [{"name": "web", "action": "allow"}]}})])
     current = read_current(client, "snippet", "S", set(unchanged.items))
-    assert plan_changes(unchanged, current, any_rulebase=True)[0].action == UNCHANGED
+    assert plan_changes(unchanged, current)[0].action == UNCHANGED
 
     edited = merge_sources([("folder", "All", {"security/security-rules": {"post": [{"name": "web", "action": "deny"}]}})])
-    change = plan_changes(edited, current, any_rulebase=True)[0]
+    change = plan_changes(edited, current)[0]
     assert change.action == UPDATE and change.current["id"] == "x1"
 
 
@@ -310,7 +313,7 @@ def test_new_snippet_rules_are_ordered_although_scm_lists_them_under_pre(fake_sc
     client.snippet_rules_in_both = True
     desired = merge_sources([("folder", "All", {"security/security-rules": {
         "post": [{"name": "r1", "action": "allow"}, {"name": "r2", "action": "allow"}, {"name": "r3", "action": "allow"}]}})])
-    changes = plan_changes(desired, read_current(client, "snippet", "S", set(desired.items)), any_rulebase=True)
+    changes = plan_changes(desired, read_current(client, "snippet", "S", set(desired.items)))
     done, _ = apply_changes(client, changes, "snippet", "S")
     assert restore_rule_order(client, desired, done, "snippet", "S") == []
     assert [r["name"] for r in client.items[RULES]] == ["r1", "r2", "r3"]

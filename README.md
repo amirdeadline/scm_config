@@ -37,7 +37,8 @@ python config_export.py --folder "Remote Networks" --snippet "Branch-Std"
 
 | Option | Meaning |
 |---|---|
-| `--folder NAME` | Export this folder and every custom snippet attached to it. Repeatable. |
+| `--folder NAME` | Export this folder and everything it inherits: its parent folders up to `All`, and the custom snippets attached to any of them. Repeatable. |
+| `--no-inherited` | With `--folder`: export only that folder and its own custom snippets. |
 | `--snippet NAME` | Export this snippet. Repeatable. |
 | `--output FILE` | Output JSON file. Default `scm_export_<TSG>_<timestamp>.json`. |
 | `--list` | Print folder and snippet names, then exit. |
@@ -71,8 +72,15 @@ The full list, in import order, is in [scm_catalog.py](scm_catalog.py).
 - A built-in object you edited or overrode is stored by SCM in your folder or
   snippet, so it is exported. SCM marks it with `override_loc` and `override_type`
   (for example the colour of the built-in tag `Sanctioned`).
-- Each folder and snippet holds only what is defined in it. Inherited items are
-  not copied into child folders.
+- **A folder export includes what the folder inherits.** For example
+  `--folder "Mobile Users"` also exports `Mobile Users Container`, `Prisma Access`
+  and `All`, and the custom snippets attached to them. Each one keeps its own key,
+  so every item stays under the folder or snippet it is defined in, and nothing is
+  copied into the child. `metadata.selection.inherited_from` lists what was added.
+  Use `--no-inherited` to export the folder alone.
+- Built-in snippets (type `predefined`, such as `DNS-Best-Practice`, `office365`,
+  `GlobalProtect-Default`) are named in `attached_snippets`, but their content is
+  Palo Alto Networks content and is not exported.
 - Prisma Access-only settings (remote networks, service connections, mobile-agent
   settings) are out of scope.
 - **Snippet content is not copied into folders.** An object SCM returns for a
@@ -86,9 +94,12 @@ The full list, in import order, is in [scm_catalog.py](scm_catalog.py).
 - **Shared-in snippets count as custom.** A snippet shared into this tenant from
   another tenant is read-only here, but it is your content, so it is exported.
   `--list` marks these snippets. They cannot be an import target.
-- **Snippet rules are exported under `pre`.** SCM's API lists every snippet rule
-  under both pre and post and does not say which one it is in, so the tool files
-  it under `pre`. Check the rulebase in the SCM UI if it matters.
+- **Some rules are exported under `pre` because SCM hides their rulebase.** For
+  snippets and for Prisma Access folders such as `Mobile Users`, the API ignores
+  the pre/post filter and gives the rules no position. The list order doesn't
+  follow the rulebase either. Those rules go under `pre`, and the export prints a
+  note. Folders such as `All` report pre and post correctly. Check the rulebase in
+  the SCM UI if it matters.
 - **The `Prisma Access` folder is `Shared` in the API.** Its objects carry
   `folder: "Shared"`. The tool handles this.
 - **Some config types aren't available in every folder.** NGFW-only types such as
@@ -242,10 +253,9 @@ Objects in the target that are not in the file are never deleted.
   existed in the target are never moved.
 - NAT rules have no move API, so new NAT rules go to the bottom of the rulebase.
   Check their order in SCM.
-- In a snippet target, rules are matched by name in either rulebase, because SCM
-  does not report a snippet rule's rulebase. An existing snippet rule is updated
-  where it is and not moved between pre and post. In a folder target, a rule
-  whose name exists in the other rulebase is skipped.
+- Rules are matched by name in either rulebase, because SCM does not always say
+  which one a rule is in. An existing rule is updated where it is and never moved
+  between pre and post. A new rule goes to the rulebase it has in the file.
 - `override_loc` and `override_type` are not compared. SCM sets them itself and
   stores different values in folders and snippets.
 - Custom threat signatures are matched by `threat_id`. Settings objects without a

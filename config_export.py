@@ -35,16 +35,21 @@ What is exported
   Only custom configuration is exported. Built-in content (App-IDs, predefined
   URL categories, predefined profiles, default snippets) is left out. A built-in
   object that you edited or overrode is saved by SCM inside your folder or snippet,
-  so it is exported. Items a folder inherits from its parent folders are not
-  repeated in the child; each folder and snippet holds only what is defined in it.
-  Prisma Access-only settings (remote networks, service connections,
+  so it is exported. Each folder and snippet in the file holds only what is
+  defined in it; inherited config appears under the parent folder or snippet it
+  comes from. Prisma Access-only settings (remote networks, service connections,
   mobile-agent settings) are out of scope.
 
 What gets selected
   no --folder / --snippet   all folders, plus every custom snippet attached to a folder
-  --folder NAME             that folder, plus every custom snippet attached to it
+  --folder NAME             that folder and everything it inherits: its parent folders
+                            up to "All", and the custom snippets attached to any of them
+  --folder NAME --no-inherited
+                            that folder and its own custom snippets only
   --snippet NAME            that snippet only
-  Both options can be repeated and combined.
+  Both options can be repeated and combined. Built-in snippets (type predefined,
+  for example DNS-Best-Practice or GlobalProtect-Default) are named under
+  "attached_snippets" but their content is not exported.
 
 Output file layout
   {{
@@ -95,6 +100,8 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="export this folder and its attached snippets (repeatable)")
     parser.add_argument("--snippet", action="append", default=[], metavar="SNIPPET_NAME",
                         help="export this snippet (repeatable)")
+    parser.add_argument("--no-inherited", action="store_true",
+                        help="with --folder: leave out the parent folders and their snippets")
     parser.add_argument("--output", metavar="JSON_FILE",
                         help="output JSON file path (default: scm_export_<TSG>_<timestamp>.json)")
     parser.add_argument("--list", action="store_true",
@@ -112,9 +119,26 @@ def custom_snippets(snippets: list, shared_in: frozenset = frozenset()) -> dict:
     return {s["name"]: s for s in snippets if not is_builtin_snippet(s, shared_in)}
 
 
+def with_parent_folders(folder_map: dict, names: list) -> list:
+    """The named folders and every folder above them, root first, each once."""
+    chains = []
+    for name in names:
+        chain = []
+        while name in folder_map and name not in chain:
+            chain.insert(0, name)
+            name = folder_map[name].get("parent") or ""
+        chains.extend(chain)
+    return list(dict.fromkeys(chains))
+
+
 def select_containers(folders: list, snippets: list, want_folders: list,
-                      want_snippets: list, shared_in: frozenset = frozenset()) -> tuple:
-    """Resolve the CLI selection into (folder names, snippet names), in a stable order."""
+                      want_snippets: list, shared_in: frozenset = frozenset(),
+                      inherited: bool = True) -> tuple:
+    """Resolve the CLI selection into (folder names, snippet names), in a stable order.
+
+    With inherited, a selected folder brings its parent folders and the custom
+    snippets attached to them, because the folder inherits all of that in SCM.
+    """
     folder_map = {f["name"]: f for f in custom_folders(folders)}
     snippet_map = custom_snippets(snippets, shared_in)
     all_snippet_names = {s["name"] for s in snippets}
@@ -136,6 +160,8 @@ def select_containers(folders: list, snippets: list, want_folders: list,
 
     if not want_folders and not want_snippets:
         folder_names = list(folder_map)
+    elif inherited:
+        folder_names = with_parent_folders(folder_map, want_folders)
     else:
         folder_names = list(dict.fromkeys(want_folders))
 
@@ -320,13 +346,20 @@ def main(argv=None) -> int:
 
     try:
         folder_names, snippet_names = select_containers(folders, snippets, args.folder, args.snippet,
-                                                        shared_in)
+                                                        shared_in, inherited=not args.no_inherited)
     except ValueError as exc:
         log.error("ERROR: %s", exc)
         return 2
 
     selection = {"folders": args.folder, "snippets": args.snippet,
                  "mode": "filtered" if args.folder or args.snippet else "full"}
+    if args.folder and not args.no_inherited:
+        _, own_snippets = select_containers(folders, snippets, args.folder, [], shared_in, inherited=False)
+        selection["inherited_from"] = (
+            [f for f in folder_names if f not in args.folder]
+            + [s for s in snippet_names if s not in own_snippets and s not in args.snippet])
+        if selection["inherited_from"]:
+            log.info("Including inherited config from: %s", ", ".join(selection["inherited_from"]))
     try:
         document, failures = build_export(client, folders, snippets, folder_names, snippet_names,
                                           selection)

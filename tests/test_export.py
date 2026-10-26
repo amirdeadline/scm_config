@@ -43,8 +43,32 @@ def test_no_selection_exports_all_folders_and_attached_custom_snippets():
     assert snippets == ["corp", "gp"]  # 'default' is built-in, 'lonely' is not attached
 
 
-def test_folder_selection_includes_its_custom_snippets():
-    assert select_containers(FOLDERS, SNIPPETS, ["Mobile Users"], []) == (["Mobile Users"], ["gp"])
+def test_folder_selection_includes_parent_folders_and_their_custom_snippets():
+    # Mobile Users inherits from Shared and All, and from the 'corp' snippet attached to Shared.
+    assert select_containers(FOLDERS, SNIPPETS, ["Mobile Users"], []) == (
+        ["All", "Shared", "Mobile Users"], ["corp", "gp"])
+
+
+def test_folder_selection_without_inherited_is_the_folder_and_its_own_snippets():
+    assert select_containers(FOLDERS, SNIPPETS, ["Mobile Users"], [], inherited=False) == (
+        ["Mobile Users"], ["gp"])
+
+
+def test_two_folders_share_their_parents_once():
+    folders = FOLDERS + [{"id": "5", "name": "Remote Networks", "parent": "Shared"}]
+    assert select_containers(folders, SNIPPETS, ["Remote Networks", "Mobile Users"], []) == (
+        ["All", "Shared", "Remote Networks", "Mobile Users"], ["corp", "gp"])
+
+
+def test_main_records_inherited_folders_in_metadata(fake_scm, monkeypatch, tmp_path):
+    client = fake_scm(folders=FOLDERS, snippets=SNIPPETS)
+    monkeypatch.setattr(config_export.ScmClient, "from_settings", classmethod(lambda cls: client))
+    monkeypatch.setattr(config_export, "setup_logging", lambda *a, **k: tmp_path / "log")
+    out = tmp_path / "mu.json"
+    assert config_export.main(["--folder", "Mobile Users", "--output", str(out)]) == 0
+    document = json.loads(out.read_text(encoding="utf-8"))
+    assert list(document["folders"]) == ["All", "Shared", "Mobile Users"]
+    assert document["metadata"]["selection"]["inherited_from"] == ["All", "Shared", "corp"]
 
 
 def test_snippet_selection_only():
@@ -113,10 +137,11 @@ def test_main_writes_json_file(fake_scm, monkeypatch, tmp_path):
     monkeypatch.setattr(config_export.ScmClient, "from_settings", classmethod(lambda cls: client))
     monkeypatch.setattr(config_export, "setup_logging", lambda *a, **k: tmp_path / "log")
     out = tmp_path / "out.json"
-    assert config_export.main(["--folder", "Mobile Users", "--output", str(out)]) == 0
+    assert config_export.main(["--folder", "Mobile Users", "--no-inherited", "--output", str(out)]) == 0
     document = json.loads(out.read_text(encoding="utf-8"))
     assert list(document["folders"]) == ["Mobile Users"]
     assert list(document["snippets"]) == ["gp"]
+    assert "inherited_from" not in document["metadata"]["selection"]
     assert document["folders"]["Mobile Users"]["config"] == {"objects/addresses": [{"name": "web"}]}
     assert document["metadata"]["selection"]["mode"] == "filtered"
 
@@ -190,6 +215,21 @@ def test_snippet_rule_returned_for_both_positions_is_exported_once(fake_scm):
         path, {k: v for k, v in (params or {}).items() if k != "position"})
     config, _ = export_container(client, "snippet", "lab", [ENDPOINTS_BY_KEY["security/security-rules"]])
     assert config == {"security/security-rules": {"pre": [{"name": "Allow-ICMP", "action": "allow"}]}}
+
+
+def test_folder_rules_without_reported_rulebase_go_to_pre_with_a_note(fake_scm, caplog):
+    # Prisma Access folders such as Mobile Users ignore the position filter and give own rules no position.
+    client = fake_scm(items={RULES: [
+        {"id": "r1", "name": "allow-web", "folder": "Mobile Users", "action": "allow", "_position": "pre"},
+        {"id": "r2", "name": "printers", "folder": "Mobile Users", "action": "allow", "_position": "post"},
+    ]})
+    client.get_all_original = client.get_all
+    client.get_all = lambda path, params=None: client.get_all_original(
+        path, {k: v for k, v in (params or {}).items() if k != "position"})
+    with caplog.at_level("INFO"):
+        config, _ = export_container(client, "folder", "Mobile Users", [ENDPOINTS_BY_KEY["security/security-rules"]])
+    assert [r["name"] for r in config["security/security-rules"]["pre"]] == ["allow-web", "printers"]
+    assert "does not report pre or post for 2 rule(s)" in caplog.text
 
 
 def test_shared_in_readonly_snippet_is_custom():

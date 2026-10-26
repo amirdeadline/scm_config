@@ -3,6 +3,7 @@ logs/
 test_run/
 dist/
 scm_export_*.json
+/*.json
 
 # Python
 __pycache__/

@@ -7,12 +7,12 @@ explains setup and every option.
 
 | Area | Status |
 |---|---|
-| Export (all folders, `--folder`, `--snippet`, `--list`) | Tested on a live lab tenant |
+| Export (all folders, `--folder` with inherited config, `--snippet`, `--list`) | Tested on a live lab tenant |
 | Dry-run import into a folder or snippet | Tested on a live lab tenant |
-| Import that creates new objects and rules in a new snippet | Tested on a live lab tenant (10 items) |
-| Import that **overwrites** existing objects or rules | Unit tests only, not yet run against SCM |
-| Rule re-ordering after import (move API) | Unit tests only, not yet run against SCM |
-| Import into a **folder** | Unit tests only, not yet run against SCM |
+| Import that creates objects and rules in a new snippet | Tested on a live lab tenant (55 items, folder plus inherited config) |
+| Import that **overwrites** existing objects or rules in a snippet | Tested on a live lab tenant |
+| Rule placement after import (move API) | Tested on a live lab tenant (snippet) |
+| Import that writes into a **folder** | Dry run tested live; writes are covered by unit tests only |
 | Large imports (hundreds of rules, rate limits) | Not tested |
 
 Every import writes to the **candidate config only**. Nothing reaches devices or

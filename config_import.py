@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from scm_catalog import (BUILTIN_FOLDERS, ENDPOINTS_BY_KEY, RULE_POSITIONS, is_builtin_snippet,
-                         match_key, read_owned, rulebase_is_reported, strip_server_fields)
+                         match_key, read_owned, strip_server_fields)
 from scm_client import LOG_DIR, SETTINGS_FILE, ApiError, ScmClient, SettingsError, setup_logging
 from scm_import_plan import (CREATE, UPDATE, Palette, list_sources, load_export, merge_sources,
                              plan_changes, render_report, select_sources)
@@ -222,9 +222,9 @@ def restore_rule_order(client: ScmClient, desired, done: list, kind: str, name: 
                             f"bottom, check their order in SCM.")
             continue
         try:
+            # Both rulebases: where SCM does not report pre/post, every rule is listed under pre.
             owned = read_owned(client, endpoint, kind, name)
-            rules = owned[position] if rulebase_is_reported(kind) else [
-                rule for pos in RULE_POSITIONS for rule in owned[pos]]
+            rules = [rule for pos in RULE_POSITIONS for rule in owned[pos]]
             ids = {r["name"]: r["id"] for r in rules}
             order = [r["name"] for r in rules]
             wanted = [n for n in bucket if n in ids]
@@ -313,7 +313,7 @@ def main(argv=None) -> int:
         log.error("ERROR: %s", exc)
         return 1
 
-    changes = plan_changes(desired, current, any_rulebase=not rulebase_is_reported(kind))
+    changes = plan_changes(desired, current)
     print(render_report(changes, desired, target_label, colors))
     sys.stdout.flush()  # keep the report above the log lines when output is piped
     report_file = Path(args.report) if args.report else default_report_file()

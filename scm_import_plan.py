@@ -121,12 +121,13 @@ def comparable(item: dict) -> str:
     return json.dumps(without_markers(item), sort_keys=True, ensure_ascii=False)
 
 
-def plan_changes(desired: Desired, current: dict, any_rulebase: bool = False) -> list:
+def plan_changes(desired: Desired, current: dict) -> list:
     """Compare desired items with the target's current items, in import order.
 
     current: (endpoint key, position) -> {match key: item as read from SCM}
-    any_rulebase: match rules by name in pre or post. Used for snippet targets,
-    whose rulebase SCM does not report.
+    Rules are matched by name in either rulebase: SCM does not report pre/post for
+    snippet rules or Prisma Access folder rules, and an existing rule is updated
+    where it is, never moved between pre and post.
     """
     changes = []
     for endpoint in ENDPOINTS:
@@ -135,19 +136,15 @@ def plan_changes(desired: Desired, current: dict, any_rulebase: bool = False) ->
             bucket = desired.items.get((endpoint.key, position))
             if not bucket:
                 continue
-            existing = current.get((endpoint.key, position), {})
-            other = [p for p in positions if p and p != position]
-            other_existing = current.get((endpoint.key, other[0]), {}) if other else {}
-            if any_rulebase:
-                existing, other_existing = {**other_existing, **existing}, {}
+            existing = {}
+            for pos in (p for p in positions if p != position):
+                existing.update(current.get((endpoint.key, pos), {}))
+            existing.update(current.get((endpoint.key, position), {}))
             for item_key, (item, source) in bucket.items():
                 common = dict(endpoint_key=endpoint.key, name=item_key, source=source,
                               position=position, desired=item)
                 if not endpoint.importable:
                     changes.append(Change(SKIP, reason=endpoint.import_note, **common))
-                elif item_key not in existing and item_key in other_existing:
-                    changes.append(Change(SKIP, reason=f"a rule with this name already exists in the "
-                                                       f"{other[0]} rulebase of the target", **common))
                 elif item_key not in existing:
                     changes.append(Change(CREATE, **common))
                 elif not existing[item_key].get("id"):

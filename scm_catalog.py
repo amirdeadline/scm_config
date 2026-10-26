@@ -9,8 +9,11 @@ The list order is the import order: objects that others refer to come first,
 rules come last.
 """
 
+import logging
 from dataclasses import dataclass
 from typing import Any
+
+log = logging.getLogger("scm_catalog")
 
 # Containers that hold only Palo Alto Networks built-in content.
 BUILTIN_FOLDERS = frozenset({"predefined", "Predefined"})
@@ -255,23 +258,24 @@ def read_owned(client: Any, endpoint: Endpoint, kind: str, name: str) -> Any:
                 and not (endpoint.is_rulebase and is_placeholder_rule(i))]
     rules = {pos: [] for pos in RULE_POSITIONS}
     seen = set()
+    hidden = set()
     for pos in RULE_POSITIONS:
         for item in client.get_all(endpoint.path, {**params, "position": pos}):
             if not is_owned_custom(item, kind, name) or is_placeholder_rule(item):
                 continue
             identity = item.get("id") or item.get("name")
             if identity in seen:
+                if item.get("position") not in RULE_POSITIONS:
+                    hidden.add(identity)
                 continue
             seen.add(identity)
             own = item.get("position")
             rules[own if own in RULE_POSITIONS else pos].append(item)
+    if hidden:
+        log.info("  note: SCM does not report pre or post for %d rule(s) of %s in %s '%s'; "
+                 "they are listed under 'pre'. Check their rulebase in SCM.",
+                 len(hidden), endpoint.key, kind, name)
     return rules
-
-
-def rulebase_is_reported(kind: str) -> bool:
-    """False for snippets: SCM lists every snippet rule under both pre and post and
-    gives it no "position" field, so a snippet rule's rulebase cannot be read back."""
-    return kind != "snippet"
 
 
 def match_key(item: dict, key_field: str = "name") -> str:
